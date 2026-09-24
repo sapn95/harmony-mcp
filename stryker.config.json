@@ -1,0 +1,28 @@
+{
+  "$schema": "./node_modules/@stryker-mutator/core/schema/stryker-schema.json",
+  "_comment": "Mutation testing answers the one question a review round keeps asking by hand: if this guard were removed, would anything notice? The guards in this server are all of that shape — the host pattern, the command-exists check, the repeat clamp, the loose code comparison — and each of them is a line that can be deleted while every test stays green. Concurrency is cores minus two.",
+  "packageManager": "npm",
+  "testRunner": "command",
+  "mutate": [
+    "index.js"
+  ],
+  "coverageAnalysis": "off",
+  "incremental": false,
+  "timeoutMS": 25000,
+  "concurrency": 8,
+  "reporters": [
+    "clear-text",
+    "json"
+  ],
+  "thresholds": {
+    "high": 90,
+    "low": 70,
+    "break": null
+  },
+  "commandRunner": {
+    "command": "node --test --test-concurrency=1 test/api.test.mjs test/safety.test.mjs"
+  },
+  "runner_comment": "Not `npm test`: that also runs test/hygiene.test.mjs, which reads the tracked files looking for real personal data. A mutant in index.js cannot change what is written in a file, so those seconds would be spent once per mutant to learn nothing.",
+  "incremental_comment": "Off, and it has to be. Incremental reuse is decided per mutant from which tests covered and killed it, and the command runner reports the whole suite as ONE synthetic test whose identity does not change when a test file does.",
+  "timeout_comment": "The allowance is timeoutFactor * netTime + timeoutMS + measured overhead. The number to watch when changing either this or concurrency is not the score, it is the timeout count — if it climbs, the score is being manufactured."
+}

@@ -1,0 +1,22 @@
+node_modules/
+*.log
+.DS_Store
+
+# Credentials must never be committed — but note that this server has none: the
+# hub has no authentication at all. What these patterns still keep out is a
+# client config with a host in it, and anything copied in from a sibling repo.
+.env
+*.env
+.env.*
+*.pem
+*.key
+secrets.json
+
+# Coverage output is generated, never committed.
+coverage/
+.nyc_output/
+
+# Mutation testing: the sandbox is a copy of the working tree, and the report is
+# a rendering of a run. The config is committed; neither of these is.
+.stryker-tmp/
+reports/
