@@ -190,10 +190,11 @@ The one check this server *can* make on your behalf, and does, is that the devic
 
 A corporate VPN commonly publishes a route for the whole of `192.168.0.0/16` — which is to say, for most of the private address space the hub is likely to be sitting in. The machine's own subnet goes on working, because the directly-connected route for it is more specific and wins; every *other* address in that range is handed to the tunnel instead, and quietly goes nowhere. The hub becomes unreachable the moment the VPN comes up and reachable again when it drops, which from the outside looks like a flaky hub rather than a routing decision.
 
-Ask the routing table rather than guessing:
+Ask the routing table rather than guessing. Put your hub's real address in, and note that this is the one command on this page that will not tell you when you forget: unlike the `curl` above, `route` answers happily for the documentation address too, and since `192.0.2.0/24` is nowhere near the private range, that answer is a confident `en0` — the opposite of the diagnosis.
 
 ```bash
-route -n get 192.0.2.10      # the hub's address
+HUB=<your hub's address>        # the one the curl above worked against
+route -n get "$HUB"
 ```
 
 An `interface:` of `utun<n>` instead of `en0` is the whole diagnosis, and the `destination` line will show the wide route that claimed it. There is nothing this server can do about it: either drop the VPN while using the hub, or have whoever runs it publish a narrower route.
@@ -233,7 +234,7 @@ The suites drive the server over stdio against a mock that serves the hub's prov
 
 `scripts/hygiene.mjs` scans both the staged and the working-tree copy of every tracked file for secrets, for anything that looks like a real person's detail, for a commit identity that is not anonymous, and for a lockfile claiming it fetched a package from a registry other than the public one. `test/hygiene.test.mjs` proves the scanner itself, against throwaway repositories built per case — including filenames git has to quote and paths whose bytes are not valid UTF-8, both of which it once skipped in silence while reporting every file clean.
 
-That last rule is there because the lockfile leaked before it existed. `npm install` writes a `resolved` URL per package, so whatever registry the machine was pointed at gets committed; on a work machine that is an internal mirror, and several hundred of its URLs went out in a public repository before anything noticed. Nothing above caught it, because a bare hostname is not a credential. The rule lists the registry that *is* allowed rather than the ones that are not, for the reason the name list is kept outside the repository entirely: naming the internal host in order to forbid it would publish it in the file whose job is to keep it out. `.npmrc` pins the public registry so the URLs are not written in the first place, and the scan is what notices when a lockfile arrives from somewhere that had no such pin.
+That last rule is there because the lockfile leaked before it existed. `npm install` writes a `resolved` URL per package, so whatever registry the machine was pointed at gets committed; on a work machine that is an internal mirror, and several hundred of its URLs went out in a public repository before anything noticed. Nothing above caught it, because a bare hostname is not a credential. The rule lists the registry that *is* allowed rather than the ones that are not, for the reason the name list is kept outside the repository entirely: naming the internal host in order to forbid it would publish it in the file whose job is to keep it out. `.npmrc` pins the default registry so the URLs are mostly not written in the first place. Only mostly, and the gap is worth naming: `@scope:registry` is a separate npm config key rather than an override of `registry`, so a scoped mapping set at user level still wins for that scope, and this project installs several scoped packages. Listing them in `.npmrc` would only move the problem along to the first scoped dependency added after the list was written. The scan is what closes it, because it reads every `resolved` URL in the lockfile regardless of scope and regardless of which machine wrote the file.
 
 ### Mutation testing
 
