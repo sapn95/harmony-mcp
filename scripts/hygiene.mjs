@@ -200,6 +200,19 @@ for (const e of files) {
     // taking CI down with it because a runner cannot resolve that host.
     // `body`, not `scan`: this reads URLs, and `scan` has had its escapes
     // flattened to spaces for the benefit of the text rules.
+    //
+    // A regex over the raw text rather than JSON.parse and a walk of the
+    // structure, and that is the deliberate choice of the two. A lockfile
+    // reaches this scan in whatever state it is actually in, which includes not
+    // being valid JSON: a conflicted one mid-merge carries conflict markers, and
+    // the suite below already exercises that case for the other rules. JSON.parse
+    // would throw there, the throw would have to be swallowed, and the file would
+    // stop being checked while the summary went on calling it clean — which is
+    // the one failure this script keeps being bitten by and has a rule of its own
+    // about further up. The structural version would also have to know about
+    // `packages` and about v1's nested `dependencies`, where the regex does not
+    // care how deep anything sits. What it gives up in exchange is a key written
+    // with an escape in it, and npm does not emit one.
     if (/(^|\/)(package-lock|npm-shrinkwrap)\.json$/.test(e.bytes)) {
       const strays = new Map();
       for (const m of body.matchAll(/"resolved"\s*:\s*"([^"]+)"/g)) {
