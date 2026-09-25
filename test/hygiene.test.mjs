@@ -250,4 +250,55 @@ describe('the hygiene scan', () => {
     assert.equal(code, 1, `the conflicted working tree was never scanned:\n${out}`);
     assert.match(out, /AWS access key/);
   });
+
+  test('a lockfile resolving to another registry is a finding', () => {
+    // The hole that actually opened, and the reason the rule is shaped as an
+    // allow list. The lockfile was already being scanned — it stopped being
+    // skipped precisely because a registry URL ends up in one — but every rule it
+    // was let in for looks for a credential, and a bare hostname is not one. So
+    // an internal mirror's hostname went out in a public repository, and CI then
+    // failed fetching from a host no runner can resolve.
+    //
+    // example.org rather than anything internal-looking, which is the point: the
+    // check knows nothing about which registries are private, only which one is
+    // permitted, so a perfectly public wrong registry fails it just the same.
+    const MIRROR = 'mirror.example.org';
+    const { code, out } = scan(repo({
+      'package-lock.json': JSON.stringify({
+        name: 'fixture', lockfileVersion: 3,
+        packages: {
+          'node_modules/a': { resolved: `https://${MIRROR}/artifactory/api/npm/npm/a/-/a-1.0.0.tgz` },
+          'node_modules/b': { resolved: `https://${MIRROR}/artifactory/api/npm/npm/b/-/b-2.0.0.tgz` },
+          'node_modules/c': { resolved: 'https://registry.npmjs.org/c/-/c-3.0.0.tgz' },
+        },
+      }, null, 2) + '\n',
+    }));
+    assert.equal(code, 1, `an unexpected registry walked past the scan:\n${out}`);
+    assert.ok(out.includes(`2 package(s) resolve to ${MIRROR}`), `the host and the count are the finding:\n${out}`);
+    // The permitted one is not dragged in with them.
+    assert.doesNotMatch(out, /registry\.npmjs\.org/, `the allowed registry was reported too:\n${out}`);
+    // One line, not one per copy. An unmodified file is the same bytes in the
+    // index and in the working tree, and identical content is scanned once —
+    // worth pinning, because the same finding reported twice reads like two.
+    assert.equal(out.split('not an allowed registry').length - 1, 1, `reported once per copy:\n${out}`);
+  });
+
+  test('a lockfile resolving to the public registry passes', () => {
+    // The other half of an allow list: the ordinary lockfile of a public package
+    // has to go through untouched, or the next person deletes the check instead
+    // of fixing what it caught. The workspace link is here because its host is
+    // empty — not an allowed registry either — so it has to be skipped on its
+    // protocol rather than on its name.
+    const { code, out } = scan(repo({
+      'package-lock.json': JSON.stringify({
+        name: 'fixture', lockfileVersion: 3,
+        packages: {
+          '': { name: 'fixture', version: '1.0.0' },
+          'node_modules/a': { resolved: 'https://registry.npmjs.org/a/-/a-1.0.0.tgz' },
+          'node_modules/w': { resolved: 'file:../w', link: true },
+        },
+      }, null, 2) + '\n',
+    }));
+    assert.equal(code, 0, out);
+  });
 });
