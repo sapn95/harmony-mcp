@@ -179,11 +179,30 @@ The one check this server *can* make on your behalf, and does, is that the devic
 | `HARMONY_HUB_HOST ist nicht gesetzt` | No address in env or keychain | Store one — see above. |
 | `ist kein Hostname und keine IP` | The host has a scheme, path, port or `@` in it | Host only. The port is a separate variable. |
 | `nicht erreichbar` / `antwortet nicht` | Wrong address, or a hub on another subnet or VLAN | Try the `curl` above from the same machine. |
+| Reachable, until a VPN connects | The VPN published a route covering the hub's subnet | [See below](#a-vpn-can-swallow-the-hub). |
 | `hat die Verbindung sofort geschlossen` | Wrong remote id | Unset `HARMONY_HUB_REMOTE_ID` and let it be discovered. |
 | `Provisioning-Antwort ohne activeRemoteId` | Something on 8088 that is not a Harmony Hub | Check the address. |
 | `kennt kein Kommando` | The command is not in the hub's list for that device | `harmony_list_commands` for the real spelling; they are case-sensitive. |
 | Command succeeds, nothing happens | IR reached nothing | Expected: the result says `confirmed: false`. Check line of sight, the device's input, and that the hub's emitter points at it. |
 | `Zeitüberschreitung` on an activity | The hub is still working through the sequence | Raise `HARMONY_ACTIVITY_TIMEOUT_MS`. |
+
+### A VPN can swallow the hub
+
+A corporate VPN commonly publishes a route for the whole of `192.168.0.0/16` — which is to say, for most of the private address space the hub is likely to be sitting in. The machine's own subnet goes on working, because the directly-connected route for it is more specific and wins; every *other* address in that range is handed to the tunnel instead, and quietly goes nowhere. The hub becomes unreachable the moment the VPN comes up and reachable again when it drops, which from the outside looks like a flaky hub rather than a routing decision.
+
+Ask the routing table rather than guessing:
+
+```bash
+route -n get 192.0.2.10      # the hub's address
+```
+
+An `interface:` of `utun<n>` instead of `en0` is the whole diagnosis, and the `destination` line will show the wide route that claimed it. There is nothing this server can do about it: either drop the VPN while using the hub, or have whoever runs it publish a narrower route.
+
+Worth ruling out first, though, that the machine is on the network you think it is. If a broadcast ping turns up no neighbours at all, it is not a routing problem:
+
+```bash
+ping -c 3 192.168.1.255 >/dev/null; arp -an
+```
 
 ---
 
@@ -212,7 +231,9 @@ The gate runs, in order: a syntax check, ESLint, an offline protocol smoke test,
 
 The suites drive the server over stdio against a mock that serves the hub's provisioning endpoint and its WebSocket interface on one local port. No test can reach a real hub, the real login keychain, or anything on the internet — the address is pinned to `127.0.0.1` with a port nothing listens on unless a test hands over the mock's, and a `security` that finds nothing goes first on `PATH`. The mock is deliberately hostile where a real hub is: it answers `code` as a number on one command and a string on another, never answers `holdAction`, and can be told to close the socket on connect, refuse the upgrade, or start an activity that never finishes.
 
-`scripts/hygiene.mjs` scans both the staged and the working-tree copy of every tracked file for secrets, for anything that looks like a real person's detail, and for a commit identity that is not anonymous. `test/hygiene.test.mjs` proves the scanner itself, against throwaway repositories built per case — including filenames git has to quote and paths whose bytes are not valid UTF-8, both of which it once skipped in silence while reporting every file clean.
+`scripts/hygiene.mjs` scans both the staged and the working-tree copy of every tracked file for secrets, for anything that looks like a real person's detail, for a commit identity that is not anonymous, and for a lockfile claiming it fetched a package from a registry other than the public one. `test/hygiene.test.mjs` proves the scanner itself, against throwaway repositories built per case — including filenames git has to quote and paths whose bytes are not valid UTF-8, both of which it once skipped in silence while reporting every file clean.
+
+That last rule is there because the lockfile leaked before it existed. `npm install` writes a `resolved` URL per package, so whatever registry the machine was pointed at gets committed; on a work machine that is an internal mirror, and several hundred of its URLs went out in a public repository before anything noticed. Nothing above caught it, because a bare hostname is not a credential. The rule lists the registry that *is* allowed rather than the ones that are not, for the reason the name list is kept outside the repository entirely: naming the internal host in order to forbid it would publish it in the file whose job is to keep it out. `.npmrc` pins the public registry so the URLs are not written in the first place, and the scan is what notices when a lockfile arrives from somewhere that had no such pin.
 
 ### Mutation testing
 

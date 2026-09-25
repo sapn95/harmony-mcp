@@ -53,6 +53,15 @@ const PERSONAL = [
   [/\b[A-ZÄÖÜ][a-zäöü]+(strasse|gasse|weg|platz)\s+\d{1,3}\b/, 'street address'],
 ];
 
+// Where a lockfile is allowed to say it fetched a package from. Written as what
+// is allowed rather than what is not, and that way round for the same reason the
+// name list below lives outside the repository: the registry this rule is
+// actually about is an internal one, so forbidding it by name would mean writing
+// that name into the public file whose whole job is to keep it out. An allow list
+// needs to know nothing about it. Adding an entry here is the way to permit a
+// second registry — a git dependency, say, which resolves to the forge.
+const REGISTRY_OK = new Set(['registry.npmjs.org']);
+
 // The lockfile used to be skipped wholesale, and it is exactly where an
 // authenticated registry URL ends up. Binary assets are still skipped for the
 // text rules — there is nothing to match — but a tracked PDF or screenshot is
@@ -180,6 +189,38 @@ for (const e of files) {
     // service in NFD, so a byte-exact search walked straight past them.
     for (const term of denylist || []) {
       if (nfc(scan).includes(term)) { console.log(`FAIL  ${at}: denylisted term (${term.length} chars)`); bad++; }
+    }
+    // A lockfile records a `resolved` URL per package: the registry npm was
+    // pointed at when the file was written, which on a work machine is a
+    // corporate mirror. The lockfile stopped being skipped wholesale precisely
+    // because a registry URL ends up in one — but the rules it was let in for all
+    // look for a credential, and a bare hostname is not one. It is no secret, no
+    // address and no personal detail, so every rule above passed it, and an
+    // internal hostname went out in a public repository in several hundred URLs,
+    // taking CI down with it because a runner cannot resolve that host.
+    // `body`, not `scan`: this reads URLs, and `scan` has had its escapes
+    // flattened to spaces for the benefit of the text rules.
+    if (/(^|\/)(package-lock|npm-shrinkwrap)\.json$/.test(e.bytes)) {
+      const strays = new Map();
+      for (const m of body.matchAll(/"resolved"\s*:\s*"([^"]+)"/g)) {
+        let u;
+        try { u = new URL(m[1]); } catch { continue; }
+        // A `file:` or `link:` resolved is a workspace pointer, not a fetch from
+        // a registry, and its host is empty — which is not an allowed registry
+        // either, so it has to be skipped by protocol rather than by name.
+        if (u.protocol !== 'https:' && u.protocol !== 'http:') continue;
+        if (!REGISTRY_OK.has(u.host)) strays.set(u.host, (strays.get(u.host) || 0) + 1);
+      }
+      // Grouped by host: one finding per registry rather than one per package.
+      // The leak was 327 URLs, and 327 identical lines is a wall people scroll
+      // past — the count is the part that says how far it spread.
+      for (const [host, n] of strays) {
+        // The host is named, unlike a secret or an address. By the time this
+        // fires it is already sitting in a tracked file, which is worse than it
+        // being in a log line, and a finding that will not say which registry is
+        // one nobody can act on.
+        console.log(`FAIL  ${at}: ${n} package(s) resolve to ${host}, which is not an allowed registry`); bad++;
+      }
     }
   }
 }
