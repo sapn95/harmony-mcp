@@ -1,0 +1,117 @@
+# The checks are the ones `npm run gate` runs locally, listed here one step at
+# a time rather than behind that single command. Each is still defined once, in
+# package.json; what is spelled out is only the order. The reason is the checks
+# list on a pull request: "lint" going red says what happened, where a red
+# "gate" is a log to go and read.
+#
+# The frame around them — triggers, permissions, concurrency, timeouts, and the
+# workflow and secret jobs — is the shared one:
+# https://github.com/sapn95/.github/blob/main/CI.md
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: check
+    runs-on: ubuntu-latest
+    # No browser anywhere in this one, so it is quick.
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        # The floor package.json claims to support, and the current release.
+        # Both, because "engines: >=22.4" is a claim like any other. The floor is
+        # 22.4 rather than the 20.19 of the sibling repos because this server
+        # uses the platform WebSocket client, which was only marked stable there
+        # — and because Node 20 went end-of-life in April 2026.
+        node: ["22", "24"]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # Nothing here pushes, and `pull_request` runs code from strangers.
+          persist-credentials: false
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+
+      - name: install
+        # --ignore-scripts, so a postinstall in a dependency cannot run on a
+        # runner that has just checked out somebody else's branch.
+        run: npm ci --ignore-scripts
+
+      - name: syntax
+        run: node --check index.js
+
+      - name: lint
+        run: npm run lint
+
+      # Protocol handshake and tool-schema validation. Offline: no network and
+      # no hub address, so it is safe on a public runner.
+      - name: smoke test
+        run: npm run smoke
+
+      - name: hygiene, being secrets, personal data and tracked state files
+        run: npm run hygiene
+
+      # The suites drive the server over stdio against a local mock of the hub's
+      # HTTP and WebSocket endpoints. They never reach a real hub and cannot
+      # switch anything on in anybody's living room.
+      # Fails below 90% lines / 90% functions / 80% branches.
+      - name: tests, with a coverage floor under them
+        run: npm run coverage
+
+      - name: audit
+        # A finding here is nearly always transitive and unreachable from this
+        # code, and blocking a pull request on somebody else's advisory helps
+        # nobody. Dependabot files the ones that need doing.
+        continue-on-error: true
+        run: npm audit --audit-level=high
+
+  workflows:
+    name: lint workflows
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: actionlint
+        uses: raven-actions/actionlint@v2.2.0
+        env:
+          # shellcheck's info and style notes are advisory here; a warning or
+          # worse blocks. The same setting in every repository, so the same
+          # command means the same thing everywhere.
+          SHELLCHECK_OPTS: --severity=warning
+      - name: yamllint
+        run: pipx run yamllint .
+      - name: markdownlint
+        uses: DavidAnson/markdownlint-cli2-action@v24
+
+  secrets:
+    name: secret scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # gitleaks reads the history, not just the tip.
+          fetch-depth: 0
+          persist-credentials: false
+      - name: gitleaks
+        uses: gitleaks/gitleaks-action@v3
+        env:
+          GITHUB_TOKEN: ${{ github.token }}

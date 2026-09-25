@@ -1,0 +1,45 @@
+# This file exists because the machine-wide hook in ~/.git_hooks/pre-commit does
+# `exec prek run`, and prek aborts with a non-zero exit in any repository that has
+# no configuration at all. That abort happens before git opens the message editor,
+# so the commit fails with nothing but a "no prek.toml or .pre-commit-config.yaml
+# found" line and no obvious connection to the commit that just did not happen.
+#
+# The four sibling *-mcp repos have no such file and predate the machine hook,
+# which is why they are not a precedent for leaving it out.
+#
+# The checks are the repo's own, defined once in package.json and called from
+# here rather than restated — a hook that grows its own copy of the lint rules is
+# a hook that disagrees with CI. What runs on a commit is the fast half: eslint
+# and the hygiene scan. The smoke test and the coverage floor stay in CI, where
+# they belong, because a public push is gated on the hygiene scan and not on a
+# number that takes half a minute to compute.
+#
+# language: system, because every entry here is already installed — node and the
+# repo's own devDependencies. Nothing is fetched, so a commit works offline.
+repos:
+  - repo: local
+    hooks:
+      - id: syntax
+        name: index.js parses
+        entry: node --check index.js
+        language: system
+        pass_filenames: false
+        files: ^index\.js$
+
+      - id: lint
+        name: eslint
+        entry: npm run --silent lint
+        language: system
+        pass_filenames: false
+        files: \.(js|mjs)$
+
+      # The one that matters most on a public repository, and the one whose
+      # absence is only ever noticed afterwards: secrets, anything that looks
+      # like a real person's detail, a tracked state file, and a commit identity
+      # that is not anonymous.
+      - id: hygiene
+        name: no secrets, no personal data, nothing staged by accident
+        entry: npm run --silent hygiene
+        language: system
+        pass_filenames: false
+        always_run: true
