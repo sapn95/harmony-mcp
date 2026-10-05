@@ -69,8 +69,24 @@ describe('discovery', () => {
 
   test('the socket is opened with the discovered id and the expected domain', () => {
     const c = mock.state.connections.at(-1);
-    assert.equal(c.hubId, mock.state.remoteId);
+    // The mock sends the id as a number, as a real hub does; the URL carries it
+    // as text.
+    assert.equal(typeof mock.state.remoteId, 'number', 'the mock no longer sends the real shape');
+    assert.equal(c.hubId, String(mock.state.remoteId));
     assert.equal(c.domain, 'svcs.myharmony.com');
+  });
+
+  test('a remote id sent as a string is accepted as well', async () => {
+    mock.state.remoteId = 'Example_Remote_0001';
+    const fresh = await startServer({ HARMONY_HUB_PORT: mock.port, HARMONY_TIMEOUT_MS: '1500' });
+    try {
+      const r = await fresh.call('harmony_status');
+      assert.equal(r.isError, false, r.raw);
+      assert.equal(r.data.remote_id, 'Example_Remote_0001');
+    } finally {
+      await fresh.stop();
+      mock.answersAgain();
+    }
   });
 });
 
@@ -79,7 +95,8 @@ describe('harmony_status', () => {
     mock.state.currentActivity = '10000001';
     const r = await srv.call('harmony_status');
     assert.equal(r.isError, false);
-    assert.equal(r.data.remote_id, mock.state.remoteId);
+    assert.equal(r.data.remote_id, String(mock.state.remoteId));
+    assert.equal(r.data.config_source, 'engine');
     assert.equal(r.data.firmware, '4.15.250');
     assert.equal(r.data.activities, 3);
     assert.equal(r.data.devices, 3);
@@ -201,6 +218,9 @@ describe('starting an activity', () => {
   });
 
   test('a hub that never finishes times out rather than claiming success', async () => {
+    // The mock still acknowledges the request under its id with code 200, as a
+    // real hub does at once. So this is also the proof that the acknowledgement
+    // is not mistaken for the end.
     mock.state.dropStartNotify = true;
     try {
       const r = await srv.call('harmony_start_activity', { activity_id: '10000001' });
@@ -209,6 +229,63 @@ describe('starting an activity', () => {
     } finally {
       mock.startsAgain();
     }
+  });
+
+  test('the activity that is already running is not started again', async () => {
+    // Doing so switches nothing on a real hub and leaves its engine deaf for
+    // the rest of the minute the request was given.
+    mock.state.currentActivity = '10000001';
+    const before = mock.state.started.length;
+    try {
+      const r = await srv.call('harmony_start_activity', { activity_id: '10000001' });
+      assert.equal(r.isError, false, r.raw);
+      assert.equal(r.data.started, true);
+      assert.match(r.data.note, /Lief schon/);
+      assert.equal(mock.state.started.length, before, 'the running activity was started again');
+    } finally {
+      mock.state.currentActivity = '-1';
+    }
+  });
+
+  test('a hub that will not say what is running still gets the start, and the one-step frame ends it', async () => {
+    // The check above is a shortcut, not a gate. And if the activity WAS
+    // running, a real hub ends the start with one progress frame, done 1 of 1,
+    // and no notification, which has to be read as the end.
+    mock.state.currentActivity = '10000001';
+    mock.state.answerCurrent = false;
+    const before = mock.state.started.length;
+    try {
+      const r = await srv.call('harmony_start_activity', { activity_id: '10000001' });
+      assert.equal(r.isError, false, r.raw);
+      assert.equal(r.data.started, true);
+      assert.equal(mock.state.started.length, before + 1, 'the start was held back by a question that went unanswered');
+    } finally {
+      mock.answersAgain();
+      mock.state.currentActivity = '-1';
+    }
+  });
+
+  test('power off with everything off is still sent, and ends on the help-discretes frames', async () => {
+    // The one start that is worth repeating: the hub sends the power-off codes
+    // again, which turns off whatever somebody switched on by hand.
+    mock.state.currentActivity = '-1';
+    const before = mock.state.started.length;
+    const r = await srv.call('harmony_power_off');
+    assert.equal(r.isError, false, r.raw);
+    assert.equal(r.data.started, true);
+    assert.match(r.data.note, /schon alles aus/);
+    assert.equal(mock.state.started.length, before + 1);
+  });
+
+  test('a start that is going is not reported until its counter reaches the total', async () => {
+    // The acknowledgement and the first progress frame both carry the
+    // request's id, with 200 and 100. Neither is the end.
+    mock.state.currentActivity = '-1';
+    const r = await srv.call('harmony_start_activity', { activity_id: '10000002' });
+    assert.equal(r.data.started, true);
+    assert.equal(r.data.note, undefined, 'a fresh start was called already running');
+    assert.equal(mock.state.currentActivity, '10000002');
+    mock.state.currentActivity = '-1';
   });
 });
 
@@ -254,6 +331,35 @@ describe('sending a command', () => {
     const r = await srv.call('harmony_send_command', { device_id: '20000001', command: 'VolumeDown', hold_ms: 40 });
     assert.equal(r.data.emitted.hold_ms, 40);
     assert.deepEqual(mock.state.presses.map(p => p.status), ['press', 'release']);
+  });
+
+  test('a keypress the hub refuses is reported as refused, not as emitted', async () => {
+    // A real hub answered exactly this for a Bluetooth device it had lost its
+    // pairing with, under the id of the keypress, within a tenth of a second.
+    mock.state.refuseHold = { code: 401, msg: 'Bluetooth not paired' };
+    try {
+      const r = await srv.call('harmony_send_command', { device_id: '20000001', command: 'VolumeUp' });
+      assert.equal(r.isError, false, r.raw);
+      assert.equal(r.data.emitted, false, 'a refused keypress was reported as emitted');
+      assert.match(r.data.error, /401/);
+      assert.match(r.data.error, /Bluetooth not paired/);
+      assert.match(r.data.hint, /koppeln/);
+      assert.equal(r.data.confirmed, undefined);
+    } finally {
+      mock.acceptsKeys();
+    }
+  });
+
+  test('a refusal other than Bluetooth is reported without the pairing hint', async () => {
+    mock.state.refuseHold = { code: 566, msg: 'Command not found for device id:20000001' };
+    try {
+      const r = await srv.call('harmony_send_command', { device_id: '20000001', command: 'Mute' });
+      assert.equal(r.data.emitted, false);
+      assert.match(r.data.error, /566/);
+      assert.equal(r.data.hint, undefined, 'a pairing hint for something that is not about pairing');
+    } finally {
+      mock.acceptsKeys();
+    }
   });
 });
 
@@ -311,11 +417,11 @@ describe('a hub that misbehaves', () => {
   });
 
   test('a configured id the hub disagrees with is a warning, not a silent wrong answer', async () => {
-    const fresh = await startServer({ HARMONY_HUB_PORT: mock.port, HARMONY_HUB_REMOTE_ID: 'Example_Remote_9999', HARMONY_TIMEOUT_MS: '1500' });
+    const fresh = await startServer({ HARMONY_HUB_PORT: mock.port, HARMONY_HUB_REMOTE_ID: '30009999', HARMONY_TIMEOUT_MS: '1500' });
     try {
       const r = await fresh.call('harmony_status');
-      assert.match(r.data.warning, /Example_Remote_9999/);
-      assert.match(r.data.warning, /Example_Remote_0001/);
+      assert.match(r.data.warning, /30009999/);
+      assert.match(r.data.warning, new RegExp(String(mock.state.remoteId)));
     } finally {
       await fresh.stop();
     }
@@ -325,7 +431,7 @@ describe('a hub that misbehaves', () => {
     // The warning above is only possible because status asks. A server that
     // trusted the configured value would have nothing to compare against, and
     // the check above would pass while proving nothing.
-    const fresh = await startServer({ HARMONY_HUB_PORT: mock.port, HARMONY_HUB_REMOTE_ID: mock.state.remoteId, HARMONY_TIMEOUT_MS: '1500' });
+    const fresh = await startServer({ HARMONY_HUB_PORT: mock.port, HARMONY_HUB_REMOTE_ID: String(mock.state.remoteId), HARMONY_TIMEOUT_MS: '1500' });
     const before = mock.state.provisions;
     try {
       const r = await fresh.call('harmony_status');
@@ -334,6 +440,86 @@ describe('a hub that misbehaves', () => {
       assert.ok(mock.state.provisions > before, 'the configured id was taken on trust');
     } finally {
       await fresh.stop();
+    }
+  });
+});
+
+describe('a hub whose ?config never answers', () => {
+  // A real hub did this after its device list had been edited locally, and went
+  // on running activities and keypresses. Without a fallback every tool here
+  // died on it, because every one starts by reading the configuration.
+  let fresh;
+  const configAsked = () => mock.state.cmds.filter(c => c === `${ENGINE}?config`).length;
+  before(async () => {
+    mock.state.configStalls = true;
+    fresh = await startServer({ HARMONY_HUB_PORT: mock.port, HARMONY_TIMEOUT_MS: '1500' });
+  });
+  after(async () => { await fresh?.stop(); mock.answersAgain(); });
+
+  test('the devices come from the hub\'s own device list instead', async () => {
+    const r = await fresh.call('harmony_list_devices');
+    assert.equal(r.isError, false, r.raw);
+    const tv = r.data.devices.find(d => d.id === '20000001');
+    assert.equal(tv.label, 'Example_TV');
+    assert.equal(tv.manufacturer, 'Example_Maker');
+    assert.equal(tv.model, 'Example_Model_A');
+    assert.equal(tv.type, 'Television');
+    assert.equal(r.data.devices.length, 3);
+  });
+
+  test('once unanswered, the question is not asked again', async () => {
+    const before = configAsked();
+    await fresh.call('harmony_list_devices');
+    assert.equal(configAsked(), before, 'every call paid the whole timeout again');
+  });
+
+  test('the activities include PowerOff, as the engine lists it', async () => {
+    const r = await fresh.call('harmony_list_activities');
+    const ids = r.data.activities.map(a => a.id);
+    assert.deepEqual(ids, ['-1', '10000001', '10000002']);
+  });
+
+  test('a command is still checked against the device, and sent', async () => {
+    mock.state.presses.length = 0;
+    const bad = await fresh.call('harmony_send_command', { device_id: '20000001', command: 'Volumeup' });
+    assert.match(bad.data.error, /Volumeup/);
+    assert.equal(mock.state.presses.length, 0);
+    const good = await fresh.call('harmony_send_command', { device_id: '20000001', command: 'VolumeUp' });
+    assert.equal(good.data.emitted.command, 'VolumeUp');
+    assert.equal(mock.state.presses.length, 2);
+  });
+
+  test('status says where the lists came from', async () => {
+    const r = await fresh.call('harmony_status');
+    assert.equal(r.isError, false, r.raw);
+    assert.equal(r.data.config_source, 'resources');
+    assert.equal(r.data.devices, 3);
+    assert.equal(r.data.activities, 3);
+  });
+
+  test('the account id the lists are read by goes into no result', async () => {
+    const raws = [];
+    for (const name of ['harmony_status', 'harmony_list_devices', 'harmony_list_activities', 'harmony_current_activity']) {
+      raws.push((await fresh.call(name)).raw);
+    }
+    raws.push((await fresh.call('harmony_list_commands', { device_id: '20000001' })).raw);
+    assert.ok(!/Example_Account_0001/.test(raws.join('\n') + fresh.stderr()), 'the account id reached a result');
+  });
+
+  test('a hub that cannot be asked for its account cannot be read this way, and says so', async () => {
+    // A configured remote id lets a server start without provisioning — and
+    // provisioning is where the account id comes from.
+    mock.state.provisionStatus = 503;
+    const blind = await startServer({ HARMONY_HUB_PORT: mock.port, HARMONY_HUB_REMOTE_ID: String(mock.state.remoteId), HARMONY_TIMEOUT_MS: '1500' });
+    try {
+      const r = await blind.call('harmony_list_devices');
+      assert.equal(r.isError, true);
+      assert.match(r.raw, /Account-ID/);
+    } finally {
+      await blind.stop();
+      // Last in this block, so restoring everything, ?config included, costs
+      // the tests after it nothing.
+      mock.answersAgain();
     }
   });
 });

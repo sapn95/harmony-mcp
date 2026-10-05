@@ -35,6 +35,10 @@ writeFileSync(join(NULL_KEYCHAIN, 'security'),
 export const FAKE = {
   HARMONY_HUB_HOST: '127.0.0.1',
   HARMONY_HUB_PORT: '1',
+  // Not an address, but the same "every server under test" reasoning: a
+  // keypress waits this long for the hub to refuse it, the mock refuses at
+  // once, and the real default of 800 ms per keypress adds up over a suite.
+  HARMONY_REFUSAL_WINDOW_MS: '150',
 };
 
 // 30s per call is generous for a local mock, deliberately: on a loaded CI runner

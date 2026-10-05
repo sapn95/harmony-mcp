@@ -112,6 +112,9 @@ const ms = (name, dflt) => {
 };
 const TIMEOUT_MS = ms('HARMONY_TIMEOUT_MS', 10000);
 const ACTIVITY_TIMEOUT_MS = ms('HARMONY_ACTIVITY_TIMEOUT_MS', 45000);
+// How long a keypress waits for the hub to object to it. A real hub refuses
+// within about a tenth of a second; the rest is headroom for Wi-Fi.
+const REFUSAL_WINDOW_MS = ms('HARMONY_REFUSAL_WINDOW_MS', 800);
 
 // Truncate the far end's prose before it goes into a tool result. There is no
 // credential in this server to strip out of it, which is why there is no
@@ -130,6 +133,11 @@ const excerpt = (s, n) => String(s ?? '').slice(0, n);
 // comparison against a host that no longer serves anything.
 const PROVISION_ORIGIN = 'http://sl.dhg.myharmony.com';
 let discovered = null;
+// The Logitech account id, from the same provisioning answer. It is kept for one
+// purpose only, the fallback in config() below, which addresses the hub's own
+// device and activity lists by it. It identifies an account, so like the e-mail
+// address in that answer it goes into no tool result.
+let account = null;
 let pendingRemote = null;
 function hubSaysId() {
   if (discovered) return Promise.resolve(discovered);
@@ -170,11 +178,20 @@ async function provision() {
   }
   if (!r.ok) throw new Error(`Provisioning → ${r.status}: ${excerpt(await r.text(), 300)}`);
   const j = await r.json().catch(() => null);
-  const id = j?.data?.activeRemoteId;
+  // A real hub sends activeRemoteId as a NUMBER. The first version of this check
+  // insisted on a string, because that is what the mock it was tested against
+  // sent, and so it refused every real hub at the first call with "ohne
+  // activeRemoteId" while the id sat right there in the answer. Both shapes are
+  // accepted; everything downstream works with the string.
+  const raw = j?.data?.activeRemoteId;
+  const id = typeof raw === 'number' && Number.isSafeInteger(raw) && raw > 0 ? String(raw)
+    : typeof raw === 'string' && raw ? raw : null;
   // The provisioning answer also carries the Logitech account's e-mail address,
-  // which is why only this one field is ever read out of it and the body is
+  // which is why only these two fields are ever read out of it and the body is
   // never forwarded to a tool result.
-  if (typeof id !== 'string' || !id) throw new Error('Provisioning-Antwort ohne activeRemoteId.');
+  if (!id) throw new Error('Provisioning-Antwort ohne activeRemoteId.');
+  const acct = j?.data?.accountId;
+  account = (typeof acct === 'number' || typeof acct === 'string') && /^[A-Za-z0-9_-]{1,64}$/.test(String(acct)) ? String(acct) : null;
   discovered = id;
   return id;
 }
@@ -195,7 +212,14 @@ async function openHub() {
   const url = `ws://${authority()}/?domain=svcs.myharmony.com&hubId=${encodeURIComponent(id)}`;
   const ws = new WebSocket(url);
   const pending = new Map();
-  const waiters = new Map();
+  // Requests settled by a predicate rather than by their own id. Each entry is
+  // { test(message), done(message) }; see request().
+  const waiters = new Set();
+  // Fire-and-forget frames, by id. A keypress the hub accepts is never answered,
+  // but one it refuses is, under the id it was sent with. Those answers are
+  // collected here and read by objections().
+  const unanswered = new Set();
+  const refused = [];
   let closed = null;
 
   // Whether the hub has ever said anything on this socket. It decides how a
@@ -215,8 +239,14 @@ async function openHub() {
     const key = m?.id == null ? null : String(m.id);
     const settle = key != null && pending.get(key);
     if (settle) { pending.delete(key); settle(m); return; }
-    const waiting = m?.type && waiters.get(m.type);
-    if (waiting) { waiters.delete(m.type); waiting(m); }
+    if (key != null && unanswered.has(key)) {
+      unanswered.delete(key);
+      if (!ok(m)) refused.push(m);
+      return;
+    }
+    for (const w of waiters) {
+      if (w.test(m)) { waiters.delete(w); w.done(m); }
+    }
   });
   // A hub handed a remote id it does not know accepts the TCP connection, lets
   // the upgrade complete, and only then closes with 1008. The handshake has
@@ -230,7 +260,7 @@ async function openHub() {
   // ever said a word before hanging up. It never does when the id is wrong.
   const closedBy = reason => {
     closed ??= served ? reason : `${reason} — und zwar bevor der Hub überhaupt geantwortet hat; stimmt die remote id?`;
-    for (const f of [...pending.values(), ...waiters.values()]) f(null);
+    for (const f of [...pending.values(), ...[...waiters].map(w => w.done)]) f(null);
     pending.clear(); waiters.clear();
   };
   ws.addEventListener('close', ev => { closedBy(`Verbindung geschlossen (${ev.code})`); });
@@ -256,35 +286,56 @@ async function openHub() {
   });
 
   let seq = 0;
-  // `notify` names a notification type to settle on instead of an id, which is
-  // how startactivity is awaited.
-  const request = (cmd, params, { notify, timeout = TIMEOUT_MS } = {}) => {
+  // By default a request is settled by the first answer that carries its id.
+  // `until(message, id)` replaces that with a predicate offered every frame that
+  // nothing else claimed, which is how startactivity is awaited: its answer is
+  // a notification with no id at all, and the frames that DO carry its id are
+  // an acknowledgement and progress reports rather than the end of it.
+  const request = (cmd, params, { until, timeout = TIMEOUT_MS } = {}) => {
     if (closed) return Promise.reject(new Error(closed));
     const key = String(++seq);
     return new Promise((resolve, reject) => {
+      let waiter = null;
       const t = setTimeout(() => {
         pending.delete(key);
-        if (notify) waiters.delete(notify);
-        reject(new Error(`${cmd}: Zeitüberschreitung nach ${timeout / 1000}s.`));
+        if (waiter) waiters.delete(waiter);
+        // Marked, because a timeout is the one failure config() answers by
+        // asking somewhere else instead of giving up.
+        reject(Object.assign(new Error(`${cmd}: Zeitüberschreitung nach ${timeout / 1000}s.`), { timedOut: true }));
       }, timeout);
       t.unref?.();
       // A null hands back the socket dying rather than an answer, which is the
       // difference between "the hub said no" and "the hub went away" — and the
       // second one must not be reported as the first.
       const done = m => { clearTimeout(t); if (m === null) reject(new Error(closed || 'Verbindung verloren')); else resolve(m); };
-      if (notify) waiters.set(notify, done); else pending.set(key, done);
+      if (until) { waiter = { test: m => until(m, key), done }; waiters.add(waiter); } else pending.set(key, done);
       ws.send(JSON.stringify({ hubId: id, timeout: 60, hbus: { cmd, id: key, params: params || {} } }));
     });
   };
-  // holdAction is the one command the hub never answers: it replies with an
-  // unrelated `harmonyengine.metadata?notify` carrying no id, so there is
-  // nothing for request() to match and it waited out its whole budget on every
-  // single keypress. A tap became twenty seconds and a repeat of three timed the
-  // tool call out. That is not a quirk to work around either — it is the wire
-  // telling us what the header comment says, that IR has no return path.
+  // holdAction is never answered when the hub accepts it: no reply with its id,
+  // at most an unrelated `harmonyengine.metadata?notify` with none. Awaiting it
+  // burned the whole budget on every keypress — a tap became twenty seconds and
+  // a repeat of three timed the tool call out — so it is sent without waiting.
+  //
+  // A REFUSAL is answered, though, under the id it was sent with, and the first
+  // release missed that: a real hub replies 566 "Command not found for device
+  // id" and 401 "Bluetooth not paired" within a tenth of a second. Ignoring those
+  // reported a keypress the hub had declined as emitted. So the id is remembered
+  // and an answer to it is kept for objections().
   const send = (cmd, params) => {
     if (closed) throw new Error(closed);
-    ws.send(JSON.stringify({ hubId: id, timeout: 60, hbus: { cmd, id: String(++seq), params: params || {} } }));
+    const key = String(++seq);
+    unanswered.add(key);
+    ws.send(JSON.stringify({ hubId: id, timeout: 60, hbus: { cmd, id: key, params: params || {} } }));
+  };
+  // Silence for this long is as close to "accepted" as the protocol gets. Polled,
+  // because a refusal is recorded by the message handler, not handed over.
+  const objections = async ms => {
+    const until = Date.now() + ms;
+    for (;;) {
+      if (refused.length || closed || Date.now() >= until) return refused.slice();
+      await new Promise(r => { setTimeout(r, 20).unref?.(); });
+    }
   };
   // close() queues the close frame behind whatever is still buffered, but a
   // socket torn down in the caller's finally on the same tick as the last send
@@ -297,12 +348,25 @@ async function openHub() {
       await new Promise(r => { setTimeout(r, 10).unref?.(); });
     }
   };
-  return { remoteId: id, request, send, drain, close: () => { try { ws.close(); } catch { /* already gone */ } } };
+  return { remoteId: id, request, send, objections, drain, close: () => { try { ws.close(); } catch { /* already gone */ } } };
 }
 
+// The first time ?config goes unanswered, the tool runs once more on a socket of
+// its own. Measured on the hub that stalls: on the socket the question was left
+// pending on, the next request timed out as well, and on a fresh one the same
+// request took a second. Every tool reads the configuration before it sends
+// anything that switches a device, so running it again repeats nothing.
 async function withHub(fn) {
-  const hub = await openHub();
-  try { return await fn(hub); } finally { hub.close(); }
+  for (let attempt = 0; ; attempt++) {
+    const hub = await openHub();
+    try {
+      return await fn(hub);
+    } catch (e) {
+      if (!e?.configStalled || attempt > 0) throw e;
+    } finally {
+      hub.close();
+    }
+  }
 }
 
 // The hub answers `code` as 200 the number on one command and "200" the string
@@ -311,24 +375,94 @@ async function withHub(fn) {
 const ok = m => String(m?.code ?? '') === '200';
 const ENGINE = 'vnd.logitech.harmony/vnd.logitech.harmony.engine';
 
+// Set the first time the hub leaves ?config unanswered, and from then on the
+// question is not asked again in this process: each attempt costs the whole
+// HARMONY_TIMEOUT_MS before the fallback starts. A one-way latch, so two calls
+// that time out together both setting it is the same as one doing so.
+let configStalls = false;
+const stalled = () => { configStalls = true; };
+
+// null when the hub let the question time out; any other failure is thrown.
+async function engineConfig(hub) {
+  try {
+    return await hub.request(`${ENGINE}?config`, { verb: 'get' });
+  } catch (e) {
+    if (!e?.timedOut) throw e;
+    stalled();
+    return null;
+  }
+}
+
+// The engine's ?config is the usual source, and it can stop answering for good.
+// A real hub did exactly that after its device list was edited locally through
+// proxy.resource?put: getCurrentActivity, startactivity and every keypress went
+// on working, and ?config said nothing for five minutes and more. Every tool
+// here starts by reading the configuration, so the server was dead on a hub that
+// was not. The lists that edit went into are where the hub keeps the truth
+// anyway, so a timeout falls back to reading them. Any other failure is
+// reported as it was, because it is an answer.
 async function config(hub) {
-  const m = await hub.request(`${ENGINE}?config`, { verb: 'get' });
+  if (configStalls) return fromResources(hub);
+  const m = await engineConfig(hub);
+  // Not read on this socket: withHub starts the tool again on a fresh one, and
+  // with the latch set this function goes straight to the resources there.
+  if (!m) throw Object.assign(new Error('?config bleibt unbeantwortet.'), { configStalled: true });
   if (!ok(m)) throw new Error(`Konfiguration nicht lesbar: ${excerpt(m?.msg, 120)} (code ${m?.code})`);
-  return { activities: m.data?.activity || [], devices: m.data?.device || [] };
+  return { activities: m.data?.activity || [], devices: m.data?.device || [], source: 'engine' };
 }
 
 // -1 is not a sentinel this server invented: it is the activity id the hub uses
 // for "everything off", and it comes back from getCurrentActivity as the answer
 // meaning nothing is running.
 const POWER_OFF = '-1';
+
+// The same two lists config() returns, read from the hub's own resources:
+// harmony://Account/<account>/DeviceList and .../ActivityList, which is where
+// the device and activity definitions live and what a local edit writes to.
+// Shaped into what the engine's ?config would have said, so nothing after this
+// knows which of the two it got. Two things are not in these lists: the button
+// groups, so every command sits in one group labelled with its own name, and
+// the PowerOff activity, which the engine lists and which is added here so both
+// sources describe the same room.
+async function fromResources(hub) {
+  if (!account) {
+    throw new Error('Der Hub beantwortet ?config nicht, und ohne die Account-ID aus dem Provisioning lassen sich seine Geräte- und Aktivitätslisten nicht lesen.');
+  }
+  // The account id goes into the request and into nothing that comes back out:
+  // not into an error, and not into a hub message quoted in one.
+  const quiet = s => excerpt(String(s ?? '').split(account).join('…'), 120);
+  const read = async name => {
+    const m = await hub.request('proxy.resource?get', { uri: `harmony://Account/${account}/${name}` });
+    let res = m?.data?.resource;
+    if (typeof res === 'string') { try { res = JSON.parse(res); } catch { res = null; } }
+    const inner = m?.data?.code;
+    if (!ok(m) || (inner != null && String(inner) !== '200') || !res || typeof res !== 'object') {
+      throw new Error(`Konfiguration nicht lesbar: ?config antwortet nicht, und ${name} auch nicht (${quiet(m?.msg)}, code ${m?.code}).`);
+    }
+    return res;
+  };
+  const [dl, al] = await Promise.all([read('DeviceList'), read('ActivityList')]);
+  const devices = (dl.DevicesWithFeatures || []).map(e => {
+    const d = e?.Device || {};
+    return {
+      id: String(d['Id-'] ?? ''), label: d.Name, type: d.DeviceTypeDisplayName,
+      manufacturer: d.Manufacturer, model: d.Model,
+      controlGroup: [{ name: 'Commands', function: (e?.Commands || []).filter(c => c?.Name).map(c => ({ name: c.Name, label: c.Name })) }],
+    };
+  });
+  const activities = [{ id: POWER_OFF, label: 'PowerOff' },
+    ...(al.Activities || []).map(a => ({ id: String(a?.['Id-'] ?? ''), label: a?.Name }))];
+  return { activities, devices, source: 'resources' };
+}
+
 const activityRow = (a, current) => ({ id: String(a?.id), label: a?.label, ...(String(a?.id) === current ? { current: true } : {}) });
 const deviceRow = d => ({ id: String(d?.id), label: d?.label, type: d?.type, manufacturer: d?.manufacturer, model: d?.model });
 // A device's commands are two levels down, grouped by the part of the remote
 // they sit on — the flattening is what makes them addressable by name.
 const commandsOf = d => (d?.controlGroup || []).flatMap(g => (g?.function || []).map(f => ({ name: f?.name, label: f?.label, group: g?.name })));
 
-async function currentActivity(hub) {
-  const m = await hub.request(`${ENGINE}?getCurrentActivity`, { verb: 'get' });
+async function currentActivity(hub, opts) {
+  const m = await hub.request(`${ENGINE}?getCurrentActivity`, { verb: 'get' }, opts);
   if (!ok(m)) throw new Error(`Aktuelle Aktivität nicht lesbar: ${excerpt(m?.msg, 120)} (code ${m?.code})`);
   return String(m.data?.result ?? POWER_OFF);
 }
@@ -351,6 +485,39 @@ function hubId(what, v) {
 const clamp = (v, lo, hi, dflt) => Math.min(hi, Math.max(lo, Math.trunc(Number(v)) || dflt));
 
 const IR_NOT_CONFIRMED = 'Der Hub bestätigt nur, dass er den Code gesendet hat — nicht, dass das Gerät reagiert hat. IR ist ohne Rückkanal.';
+const BT_UNPAIRED = 'Das Gerät wird über Bluetooth gesteuert, und der Hub ist nicht (mehr) mit ihm gekoppelt. Neu koppeln (Harmony-App), oder das Gerät auf anderem Weg schalten, etwa über HDMI-CEC des Fernsehers.';
+
+// How an activity start ends on a real hub, recorded frame by frame, which is
+// not how the first release assumed. The request is acknowledged at once under
+// its own id with code 200 and no counter, which is NOT the end of it. Progress
+// follows under the same id as `harmony.engine?startActivity` with `done` and
+// `total`, code 100 on the way and 200 on the last one, and after that comes a
+// notification with no id and with no `vnd.logitech.harmony/vnd.logitech.` in
+// front of its type. Waiting for the prefixed name, as the mock had it, waited
+// out the whole budget on every activity and reported a timeout for a room
+// that had switched over in seven seconds.
+//
+// Two starts end differently again. The activity that is already running gets
+// a single progress frame, done 1 of 1, and no notification at all. And
+// PowerOff when everything is off re-sends the power discretes under
+// `harmony.engine?helpdiscretes`, ending with one more frame of that type that
+// has no counter. So the end is whichever of the three arrives first.
+const ACTIVITY_FINISHED = 'harmony.engine?startActivityFinished';
+const HELP_DISCRETES = 'harmony.engine?helpdiscretes';
+const activityDone = wanted => (m, key) => {
+  const d = m?.data || {};
+  const same = String(d.activityId ?? wanted) === wanted;
+  if (m?.type === ACTIVITY_FINISHED) return same;
+  if (m?.type === HELP_DISCRETES) return d.done == null && same;
+  if (key != null && String(m?.id) === key) {
+    const code = String(m?.code ?? '');
+    // Anything but "accepted" and "in progress" is the hub refusing, and
+    // waiting on would turn that into a timeout that blames the network.
+    if (code !== '100' && code !== '200') return true;
+    return d.total != null && String(d.done) === String(d.total);
+  }
+  return false;
+};
 
 const TOOLS = [
   { name: 'harmony_status', description: 'Verify the hub is reachable and show its address, remote id, firmware and the activity that is currently running.', inputSchema: { type: 'object', properties: {} } },
@@ -397,7 +564,7 @@ server.setRequestHandler(CallToolRequestSchema, async req => {
       // it found rather than throwing on the first surprise.
       const id = await remoteId();
       return await withHub(async hub => {
-        const { activities, devices } = await config(hub);
+        const { activities, devices, source } = await config(hub);
         const current = await currentActivity(hub);
         const running = activities.find(a => String(a?.id) === current);
         // A configured remote id was reported as correct without ever being
@@ -429,6 +596,12 @@ server.setRequestHandler(CallToolRequestSchema, async req => {
         } catch { /* older or newer firmware, not a failure */ }
         return text({
           hub: authority(), remote_id: id, ...(firmware ? { firmware } : {}), ...mismatch,
+          // Where the device and activity lists came from: `engine` is ?config,
+          // `resources` means the hub left ?config unanswered and they were read
+          // from its proxy.resource lists instead. Worth seeing here, because the
+          // second costs one timeout per process and labels every command with
+          // its own name.
+          config_source: source,
           activities: activities.length, devices: devices.length,
           current_activity: current === POWER_OFF ? null : { id: current, label: running?.label },
           ...(current !== POWER_OFF && !running ? { note: `Der Hub meldet Aktivität ${current}, die in seiner eigenen Konfiguration nicht vorkommt.` } : {}),
@@ -485,20 +658,39 @@ server.setRequestHandler(CallToolRequestSchema, async req => {
         if (wanted !== POWER_OFF && !activities.some(a => String(a?.id) === wanted)) {
           return text({ error: `Keine Aktivität mit activity_id ${wanted}`, activities: activities.map(a => activityRow(a, '')) });
         }
+        const label = activities.find(a => String(a?.id) === wanted)?.label;
+        const activity = wanted === POWER_OFF ? { id: POWER_OFF, label: 'PowerOff' } : { id: wanted, label };
+        // Starting the activity that is already running switches nothing and
+        // costs a minute. Measured on a real hub: the start is answered with a
+        // single done-1-of-1 frame, never finishes, and the engine then answers
+        // nothing else — not even getCurrentActivity — until the 60-second
+        // timeout every client puts on a request has run out. So it is not sent.
+        // PowerOff is the exception: with everything off, the hub re-sends the
+        // power-off codes and is done in seconds, which is what turns off a
+        // device somebody switched on by hand.
+        //
+        // Best effort, on a short budget: a hub that will not say what is running
+        // does not stop the start, it only loses the shortcut.
+        const now = await currentActivity(hub, { timeout: Math.min(TIMEOUT_MS, 3000) }).catch(() => null);
+        if (now === wanted && wanted !== POWER_OFF) {
+          return text({ started: true, activity, note: 'Lief schon. Nicht neu gestartet, weil der Hub danach eine Minute lang nicht mehr antwortet.' });
+        }
         const m = await hub.request(`${ENGINE}?startactivity`, {
           async: 'true', timestamp: 0, args: { rule: 'start' }, activityId: wanted,
-        }, { notify: `${ENGINE}?startActivityFinished`, timeout: ACTIVITY_TIMEOUT_MS });
-        const code = m?.data?.errorCode;
-        const label = activities.find(a => String(a?.id) === wanted)?.label;
+        }, { until: activityDone(wanted), timeout: ACTIVITY_TIMEOUT_MS });
         // The notification carries its own result, and it is not the same thing
         // as the request having been accepted: a hub that cannot reach one
         // device in the activity finishes with a non-200 and leaves the room
         // half switched. Reporting "started" off the back of the send was a
         // statement about the physical world that nobody had checked.
+        const code = m?.type === ACTIVITY_FINISHED ? m?.data?.errorCode : m?.type === HELP_DISCRETES ? '200' : m?.code;
         if (code != null && String(code) !== '200') {
-          return text({ started: false, activity: { id: wanted, label }, error: `Hub meldet ${code}: ${excerpt(m?.data?.errorString, 200)}` });
+          return text({ started: false, activity: { id: wanted, label }, error: `Hub meldet ${code}: ${excerpt(m?.data?.errorString ?? m?.msg, 200)}` });
         }
-        return text({ started: true, activity: wanted === POWER_OFF ? { id: POWER_OFF, label: 'PowerOff' } : { id: wanted, label } });
+        return text({
+          started: true, activity,
+          ...(now === wanted ? { note: 'War schon alles aus. Der Hub hat die Ausschaltbefehle noch einmal gesendet.' } : {}),
+        });
       });
     }
 
@@ -526,8 +718,8 @@ server.setRequestHandler(CallToolRequestSchema, async req => {
         // JSON.stringify rather than by hand: a device label with a quote in it
         // used to break out of the inner document.
         const action = JSON.stringify({ command, type: 'IRCommand', deviceId: did });
-        // send, not request: holdAction is never answered. See the note on
-        // send() — awaiting it burned the full timeout per keypress.
+        // send, not request: an accepted holdAction is never answered. See the
+        // note on send() — awaiting it burned the full timeout per keypress.
         for (let i = 0; i < repeat; i++) {
           hub.send(`${ENGINE}?holdAction`, { status: 'press', timestamp: '0', verb: 'render', action });
           // A tap is press-then-release with nothing in between; a hold is the
@@ -538,6 +730,16 @@ server.setRequestHandler(CallToolRequestSchema, async req => {
           hub.send(`${ENGINE}?holdAction`, { status: 'release', timestamp: String(holdMs), verb: 'render', action });
         }
         await hub.drain();
+        // The one thing the hub does say about a keypress is no. Heard, it is
+        // reported as what it is rather than as a code that went out.
+        const [no] = await hub.objections(REFUSAL_WINDOW_MS);
+        if (no) {
+          return text({
+            emitted: false, command, device: device.label,
+            error: `Hub lehnt ab (${no.code}): ${excerpt(no.msg, 160)}`,
+            ...(String(no.code) === '401' ? { hint: BT_UNPAIRED } : {}),
+          });
+        }
         return text({ emitted: { command, device: device.label, repeat, ...(holdMs ? { hold_ms: holdMs } : {}) }, confirmed: false, note: IR_NOT_CONFIRMED });
       });
     }

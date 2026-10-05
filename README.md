@@ -111,9 +111,11 @@ The sibling servers in this account gate the calls that spend money or reach the
 
 ## What IR cannot tell you
 
-An IR command is fire and forget, and at the wire level the protocol says so: `holdAction` is the one command the hub never answers. It replies with an unrelated metadata notification carrying no correlation id at all.
+An IR command is fire and forget, and at the wire level the protocol says so: a `holdAction` the hub accepts is never answered. At most an unrelated metadata notification arrives, carrying no correlation id at all.
 
 So when `harmony_send_command` comes back, it is reporting that the hub emitted the code. It is **not** reporting that anything reacted to it. A speaker system on the wrong input, a television that was already off, a blocked emitter, a device unplugged this morning — all four look exactly like success from here, and every result that sends a code carries `confirmed: false` saying so.
+
+What the hub *does* answer is a refusal, under the id the keypress went out with: `566 Command not found for device id` and `401 Bluetooth not paired` both arrive within a tenth of a second on a real hub. So every keypress waits `HARMONY_REFUSAL_WINDOW_MS` (800 ms) for an objection, and a refused one comes back as `emitted: false` with the hub's code and message rather than as a code that went out.
 
 The one check this server *can* make on your behalf, and does, is that the device and the command both exist in the hub's own configuration. A misspelt `Volumeup` is emitted as nothing at all and answered with the same empty notification as a real command, so without that check the room simply stays quiet and the tool call says it worked.
 
@@ -152,11 +154,19 @@ The one check this server *can* make on your behalf, and does, is that the devic
 
 ---
 
-## Three things about the hub that cost an evening to find out
+## What the hub does that cost an evening to find out
 
-- **`holdAction` is never answered.** Awaiting a reply to a keypress burns the whole timeout, once per press. A repeat of three timed the tool call out entirely. There is no acknowledgement in the protocol to wait for.
+- **An accepted `holdAction` is never answered.** Awaiting a reply to a keypress burns the whole timeout, once per press. A repeat of three timed the tool call out entirely. There is no acknowledgement in the protocol to wait for, only a refusal.
 - **An idle connection is dropped after 60 seconds.** This server therefore opens a socket per tool call and closes it again, rather than holding one open with a keepalive. A shared socket needs a ping, a reconnect path and a decision about calls that arrive during the gap — three mechanisms whose failure mode is a tool that works when used often and breaks when used once an hour, which is how a remote control is actually used.
 - **The hub is inconsistent about `code`.** One command answers `200` the number, another `"200"` the string. A server that compared strictly against either reported every command of the other kind as an error.
+
+The first release was written against a mock and the protocol notes. A real hub then showed five more, each of which broke it outright or cost a minute per call:
+
+- **`activeRemoteId` is a number.** Not the string every write-up shows. A check for a string refused every real hub at the first call, with the id sitting in the answer.
+- **The end of an activity is `harmony.engine?startActivityFinished`,** with no `vnd.logitech.harmony/vnd.logitech.` in front, although every request goes out with that prefix. Before it come an acknowledgement under the request's own id with code `200`, which is *not* the end, and progress frames `harmony.engine?startActivity` with `done` and `total`, code `100` on the way. Two starts send no `startActivityFinished` at all: the activity that is already running gets one progress frame, done 1 of 1, and PowerOff with everything off re-sends the power discretes as `harmony.engine?helpdiscretes`, ending with one more frame of that type without a counter. The server ends a start on whichever of the three arrives first.
+- **Starting the activity that is already running costs a minute.** The hub answers with a single progress frame, done 1 of 1, never finishes the request, and then answers nothing else, `getCurrentActivity` included, until the 60-second timeout in the request's envelope has run out. Measured: the next answer came at 60.5 s; with a 5-second envelope it came at once. This server therefore does not send that start; it reports the activity as running. PowerOff with everything off is still sent, because there the hub re-sends the power-off codes and is done in seconds.
+- **A refused keypress is answered.** See [What IR cannot tell you](#what-ir-cannot-tell-you).
+- **`?config` can stop answering for good.** One hub did after its device list had been edited locally through `proxy.resource?put`; activities and keypresses kept working, `?config` said nothing for five minutes and more, and every tool here starts by reading it. A timeout now falls back to the hub's own lists, `harmony://Account/<account>/DeviceList` and `ActivityList`, addressed by the account id from the provisioning answer. The account id, like the e-mail address beside it, goes into no result. `harmony_status` reports which source it used as `config_source`, and the fallback labels every command with its own name, because those lists carry no button groups.
 
 ---
 
@@ -169,6 +179,7 @@ The one check this server *can* make on your behalf, and does, is that the devic
 | `HARMONY_HUB_PORT` | `8088` | The hub's port. |
 | `HARMONY_TIMEOUT_MS` | `10000` | Budget for a config read, a status query or a handshake. |
 | `HARMONY_ACTIVITY_TIMEOUT_MS` | `45000` | Budget for an activity to finish starting. Generous because the hub walks a sequence of IR commands with deliberate gaps between them. |
+| `HARMONY_REFUSAL_WINDOW_MS` | `800` | How long a keypress waits for the hub to refuse it. A real hub refuses within about a tenth of a second. |
 
 ---
 
@@ -183,6 +194,8 @@ The one check this server *can* make on your behalf, and does, is that the devic
 | `hat die Verbindung sofort geschlossen` | Wrong remote id | Unset `HARMONY_HUB_REMOTE_ID` and let it be discovered. |
 | `Provisioning-Antwort ohne activeRemoteId` | Something on 8088 that is not a Harmony Hub | Check the address. |
 | `kennt kein Kommando` | The command is not in the hub's list for that device | `harmony_list_commands` for the real spelling; they are case-sensitive. |
+| `Hub lehnt ab (401): Bluetooth not paired` | The device is driven over Bluetooth and the hub has lost its pairing with it | Pair again through the Harmony app. Until then, nothing the hub sends that device arrives, and an activity that powers it on over Bluetooth stalls at that step. |
+| `config_source: "resources"` in `harmony_status` | The hub left `?config` unanswered | Nothing to fix here; the lists are read from the hub's resources instead. It costs one timeout per server process. |
 | Command succeeds, nothing happens | IR reached nothing | Expected: the result says `confirmed: false`. Check line of sight, the device's input, and that the hub's emitter points at it. |
 | `Zeitüberschreitung` on an activity | The hub is still working through the sequence | Raise `HARMONY_ACTIVITY_TIMEOUT_MS`. |
 
@@ -230,7 +243,7 @@ npm run mutate    # mutation-test just the lines this branch changed
 
 The gate runs, in order: a syntax check, ESLint, an offline protocol smoke test, the hygiene scan, and the suites under a coverage floor of 90% lines, 90% functions and 80% branches.
 
-The suites drive the server over stdio against a mock that serves the hub's provisioning endpoint and its WebSocket interface on one local port. No test can reach a real hub, the real login keychain, or anything on the internet — the address is pinned to `127.0.0.1` with a port nothing listens on unless a test hands over the mock's, and a `security` that finds nothing goes first on `PATH`. The mock is deliberately hostile where a real hub is: it answers `code` as a number on one command and a string on another, never answers `holdAction`, and can be told to close the socket on connect, refuse the upgrade, or start an activity that never finishes.
+The suites drive the server over stdio against a mock that serves the hub's provisioning endpoint and its WebSocket interface on one local port. No test can reach a real hub, the real login keychain, or anything on the internet — the address is pinned to `127.0.0.1` with a port nothing listens on unless a test hands over the mock's, and a `security` that finds nothing goes first on `PATH`. The mock is deliberately hostile where a real hub is: it answers `code` as a number on one command and a string on another, sends the remote id as a number, never answers an accepted `holdAction` but answers a refused one, acknowledges an activity under its id long before the unprefixed notification that ends it, and can be told to close the socket on connect, refuse the upgrade, start an activity that never finishes, or leave `?config` unanswered for good. Each of those shapes was recorded off a real hub, and four of them were missing from the first release's mock, which is how that release passed every test and failed against the real thing at the first call.
 
 `scripts/hygiene.mjs` scans both the staged and the working-tree copy of every tracked file for secrets, for anything that looks like a real person's detail, for a commit identity that is not anonymous, and for a lockfile claiming it fetched a package from a registry other than the public one. `test/hygiene.test.mjs` proves the scanner itself, against throwaway repositories built per case — including filenames git has to quote and paths whose bytes are not valid UTF-8, both of which it once skipped in silence while reporting every file clean.
 
